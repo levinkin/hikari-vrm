@@ -1,0 +1,126 @@
+name: prebuilt binaries
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-universal
+            runner: macos-15
+          - platform: windows-x64
+            runner: windows-2022
+          - platform: linux-x64
+            runner: ubuntu-22.04
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: linux build libraries
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libvulkan1 libx11-dev
+      - name: macos compiler
+        if: runner.os == 'macOS'
+        run: |
+          brew install llvm
+          printf 'CC=%s/bin/clang\nCXX=%s/bin/clang++\nMACOSX_DEPLOYMENT_TARGET=13.0\n' "$(brew --prefix llvm)" "$(brew --prefix llvm)" >> "$GITHUB_ENV"
+      - name: rust toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+      - name: build macos universal
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+          cargo build --locked --release --bin hikari-vrm --target aarch64-apple-darwin
+          cargo build --locked --release --bin hikari-vrm --target x86_64-apple-darwin
+          mkdir -p target/release
+          lipo -create target/aarch64-apple-darwin/release/hikari-vrm target/x86_64-apple-darwin/release/hikari-vrm -output target/release/hikari-vrm
+          codesign -s - target/release/hikari-vrm
+          codesign --verify --verbose target/release/hikari-vrm
+          lipo -info target/release/hikari-vrm
+          otool -L target/release/hikari-vrm
+      - name: build windows msvc
+        if: runner.os == 'Windows'
+        run: |
+          cargo build --locked --release --bin hikari-vrm --target x86_64-pc-windows-msvc
+      - name: build linux
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --locked --release --bin hikari-vrm
+          ldd target/release/hikari-vrm | tee dependencies.txt
+          ! grep -q 'not found' dependencies.txt
+      - name: package
+        shell: python
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          import json
+          import os
+          import pathlib
+          import shutil
+          import subprocess
+          import zipfile
+          platform = os.environ['PLATFORM']
+          package = pathlib.Path('package')
+          package.mkdir()
+          binary = 'hikari-vrm.exe' if platform == 'windows-x64' else 'hikari-vrm'
+          source = pathlib.Path('target/x86_64-pc-windows-msvc/release' if platform == 'windows-x64' else 'target/release') / binary
+          shutil.copy2(source, package / binary)
+          for name in ['settings.json', 'LICENSE', 'README.md']:
+              shutil.copy2(name, package / name)
+          for name in ['models', 'actions', 'animations', 'docs']:
+              shutil.copytree(name, package / name)
+          licenses = package / 'licenses'
+          licenses.mkdir()
+          engine = pathlib.Path('native/engine')
+          stb = (engine / 'stb/stb_image.h').read_text()
+          (licenses / 'stb.txt').write_text(stb[stb.index('This software is available under 2 licenses'):].removesuffix('*/\n'))
+          if platform == 'macos-universal':
+              shutil.copy2(engine / 'syphon/LICENSE', licenses / 'syphon.txt')
+          else:
+              shutil.copytree(engine / 'vulkan/LICENSES', licenses / 'vulkan')
+              shutil.copy2(engine / 'vulkan/LICENSE.md', licenses / 'vulkan.txt')
+          metadata = json.loads(subprocess.run(['cargo', 'metadata', '--format-version', '1', '--locked'], check=True, capture_output=True, text=True).stdout)
+          workspace = set(metadata['workspace_members'])
+          for crate in metadata['packages']:
+              if crate['id'] in workspace:
+                  continue
+              folder = pathlib.Path(crate['manifest_path']).parent
+              notices = [path for path in sorted(folder.iterdir()) if path.is_file() and path.name.upper().startswith(('LICENSE', 'LICENCE', 'COPYING', 'NOTICE'))]
+              if not notices:
+                  raise SystemExit(f"{crate['name']} {crate['version']} ships no license file ({crate['license']})")
+              target = licenses / 'crates' / f"{crate['name']}-{crate['version']}"
+              target.mkdir(parents=True)
+              for path in notices:
+                  shutil.copy2(path, target / path.name)
+          with zipfile.ZipFile(f'hikari-vrm-{platform}.zip', 'w', zipfile.ZIP_DEFLATED) as archive:
+              for path in sorted(package.rglob('*')):
+                  archive.write(path, path.relative_to(package))
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hikari-vrm-${{ matrix.platform }}
+          path: hikari-vrm-${{ matrix.platform }}.zip
+          if-no-files-found: error
+
+  release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --dir artifacts
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --draft --verify-tag --title "$GITHUB_REF_NAME" --notes 'ready-to-run binaries' artifacts/*/*.zip
