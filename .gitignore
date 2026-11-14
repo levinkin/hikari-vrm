@@ -1,0 +1,8 @@
+models/*
+!models/.gitkeep
+animations/*
+!animations/.gitkeep
+/target/
+__pycache__/
+/hikari-vrm
+/hikari-vrm.exe
